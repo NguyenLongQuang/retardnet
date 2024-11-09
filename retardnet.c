@@ -37,8 +37,9 @@ static unsigned int g_loss_leg(void *priv, struct sk_buff *skb, const struct nf_
 #ifdef FIX_PLR_5
     unsigned int random_value = get_random_u32() % 100;
     return random_value < 5 ? NF_DROP : NF_ACCEPT;
-#endif
+#elif
     return NF_ACCEPT;
+#endif
 }
 
 static unsigned int g_delay_leg(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
