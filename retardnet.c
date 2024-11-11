@@ -25,14 +25,121 @@
 #include <linux/random.h>
 #endif
 
-typedef unsigned int (*rule_func_t)(void *priv, struct sk_buff *skb, const struct nf_hook_state *state);
+#ifdef QUANGNL_FIX_WINDOW_COUNTER
 
-static unsigned int g_throughput_leg(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+#include <linux/jiffies.h>
+#define MAX_RATE 125000*3 // bytes -> 125kB/s = 1mb/s
+static unsigned long 			last_sec 		= 0;
+static unsigned long 			curr_sec_bytes		= 0;
+static DEFINE_SPINLOCK(throughput_lock);
+
+#else
+
+#ifdef QUANGNL_TOKEN_BUCKET
+
+#include <linux/jiffies.h>
+#define 	MAX_RATE 		125000*10 // -> 10mbps
+#define 	BURST_BYTES 		(MAX_RATE / 50) 
+
+static unsigned long 			tokens 		= BURST_BYTES; // Current tokens in bucket
+static unsigned long 			last_update 	= 0;    // Last time we added tokens
+static DEFINE_SPINLOCK(token_lock);
+
+#endif
+#endif
+
+typedef unsigned int (*rule_func_t)(
+		void 				*priv, 
+		struct sk_buff 			*skb, 
+		const struct nf_hook_state 	*state);
+
+static unsigned int g_throughput_leg(
+		void 				*priv,
+	       	struct sk_buff 			*skb,
+	       	const struct nf_hook_state 	*state)
 {
-    return NF_ACCEPT;
+#ifdef QUANGNL_FIX_WINDOW_COUNTER
+        struct iphdr *hdr;
+        unsigned long now;
+        unsigned short pkt_len;
+        unsigned int decision;
+
+        // Validate packet
+        if (!skb)
+                return NF_ACCEPT;
+
+        hdr = ip_hdr(skb);
+        if (!hdr)
+                return NF_ACCEPT;
+
+        pkt_len = ntohs(hdr->tot_len);
+        now = jiffies;
+
+        spin_lock(&throughput_lock);
+
+        // Check if we need to reset counters for new second
+        if (time_after(now, last_sec + HZ)) {
+                last_sec = now;
+                curr_sec_bytes = 0;
+        }
+
+        // Check if accepting packet would exceed rate limit
+        if (curr_sec_bytes + pkt_len <= MAX_RATE) {
+                curr_sec_bytes += pkt_len;
+                decision = NF_ACCEPT;
+        } else {
+                decision = NF_DROP;
+        }
+
+        spin_unlock(&throughput_lock);
+        return decision;
+
+#else
+#ifdef QUANGNL_TOKEN_BUCKET
+ 	struct iphdr *hdr;
+        unsigned long now, time_passed;
+        unsigned long tokens_to_add, pkt_len;
+        
+        if (!skb)
+                return NF_ACCEPT;
+                
+        hdr = ip_hdr(skb);
+        if (!hdr)
+                return NF_ACCEPT;
+
+        now = jiffies;
+        pkt_len = ntohs(hdr->tot_len);
+        
+        spin_lock(&token_lock);
+        
+        time_passed = now - last_update;
+        tokens_to_add = (MAX_RATE * time_passed) / HZ;
+
+	if(tokens_to_add > 0)
+	{
+        	// Don't exceed burst size
+        	tokens = min(tokens + tokens_to_add, BURST_BYTES);
+        	last_update = now;
+	}
+        // Check if we have enough tokens
+        if (tokens >= pkt_len) {
+                tokens -= pkt_len;
+                spin_unlock(&token_lock);
+                return NF_ACCEPT;
+        }
+        
+        spin_unlock(&token_lock);
+        return NF_DROP;
+#else
+	return NF_ACCEPT;
+#endif
+#endif
 }
 
-static unsigned int g_loss_leg(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+static unsigned int g_loss_leg(
+		void 				*priv,
+	       	struct sk_buff 			*skb, 
+		const struct nf_hook_state 	*state)
 {
 #ifdef FIX_PLR_5
     unsigned int random_value = get_random_u32() % 100;
@@ -42,12 +149,18 @@ static unsigned int g_loss_leg(void *priv, struct sk_buff *skb, const struct nf_
 #endif
 }
 
-static unsigned int g_delay_leg(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+static unsigned int g_delay_leg(
+		void 				*priv,
+	       	struct sk_buff 			*skb, 
+		const struct nf_hook_state 	*state)
 {
     return NF_ACCEPT;
 }
 
-static unsigned int g_jitter_leg(void *priv, struct sk_buff *skb, const struct nf_hook_state *state)
+static unsigned int g_jitter_leg(
+		void 				*priv,
+	       	struct sk_buff 			*skb,
+	       	const struct nf_hook_state 	*state)
 {
     return NF_ACCEPT;
 }
@@ -58,20 +171,21 @@ rule_func_t g_exe_legs[MAX_RULES] = {
     g_jitter_leg,
     g_throughput_leg};
 
-struct sock *nl_sk = NULL;
-static struct nf_hook_ops nfho;
-static __be32 target_ip = 0; // target IP for applying rules
+struct sock 				*nl_sk 		= NULL;
+static struct nf_hook_ops 		nfho;
+static __be32 				target_ip 	= 0; // target IP for applying rules
 
 // Netfilter hook function
-static unsigned int hook_func(void *priv, struct sk_buff *skb,
-                              const struct nf_hook_state *state)
+static unsigned int hook_func(
+		void 				*priv, 
+		struct sk_buff			 *skb,
+                const struct nf_hook_state 	*state)
 {
-    struct iphdr *ip_header = (struct iphdr *)skb_network_header(skb);
-
-    int accept_weight = 0;
-    int drop_weight = 0;
-    int repeat_weight = 0;
-    int stolen_weight = 0;
+    struct iphdr 	*ip_header 		= (struct iphdr *)skb_network_header(skb);
+    int 		accept_weight 		= 0;
+    int 		drop_weight 		= 0;
+    int 		repeat_weight 		= 0;
+    int 		stolen_weight 		= 0;
 
     // Check if we should drop packets from the target IP
     if (target_ip && ip_header->saddr == target_ip)
@@ -97,11 +211,14 @@ static unsigned int hook_func(void *priv, struct sk_buff *skb,
         }
 
         // Determine final action based on the highest weight
-        if (drop_weight >= accept_weight && drop_weight >= repeat_weight && drop_weight >= stolen_weight)
+        if (drop_weight >= accept_weight && 
+			drop_weight >= repeat_weight && 
+			drop_weight >= stolen_weight)
         {
             return NF_DROP;
         }
-        else if (accept_weight >= repeat_weight && accept_weight >= stolen_weight)
+        else if (accept_weight >= repeat_weight && 
+			accept_weight >= stolen_weight)
         {
             return NF_ACCEPT;
         }
@@ -133,10 +250,10 @@ static void netlink_recv_msg(struct sk_buff *skb)
 static int __init rtnet_init(void)
 {
     // Initialize Netfilter hook
-    nfho.hook = hook_func;
-    nfho.hooknum = NF_INET_PRE_ROUTING;
-    nfho.pf = PF_INET;
-    nfho.priority = NF_IP_PRI_FIRST;
+    nfho.hook 		= hook_func;
+    nfho.hooknum 	= NF_INET_PRE_ROUTING;
+    nfho.pf 		= PF_INET;
+    nfho.priority 	= NF_IP_PRI_FIRST;
     nf_register_net_hook(&init_net, &nfho);
 
     // Initialize Netlink socket
